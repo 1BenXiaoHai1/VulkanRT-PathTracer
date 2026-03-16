@@ -1,0 +1,80 @@
+#version 460
+#extension GL_EXT_ray_tracing : require // 启用 Vulkan 光线追踪扩展，允许在着色器中使用光线追踪相关的功能和语法
+
+#define M_PI 3.1415926535897932384626433832795
+
+// 定义一个 ray payload 结构体，用于在 traceRayEXT 调用时传递给Hit Shader和Miss Shader
+layout(location = 0) rayPayloadEXT Payload {
+  vec3 rayOrigin; // 光线的起点
+  vec3 rayDirection; // 光线的方向
+  vec3 previousNormal; // 上一次击中点的法线，用于计算间接光照
+  vec3 directColor; // 存储直接光照的颜色
+  vec3 indirectColor; // 存储间接光照的颜色
+  int rayDepth; // 光线的深度，表示当前光线已经反弹了多少次
+  int rayActive; // 标志，表示光线是否仍然活跃，如果为0则表示光线已经不再需要继续追踪，可以提前终止追踪过程
+}payload;
+
+layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS; // 顶层加速结构
+layout(binding = 1, set = 0) uniform Camera {
+  vec4 position;
+  vec4 right;
+  vec4 up;
+  vec4 forward;
+  uint frameCount;
+}camera; // 摄像机数据，包括位置、方向和帧计数
+
+layout(binding = 4, set = 0, rgba32f) uniform image2D image; // 输出图像，使用rgba32f格式存储每个像素的颜色数据
+
+float random(vec2 uv, float seed) {
+  return fract(sin(mod(dot(uv, vec2(12.9898, 78.233)) + 1113.1 * seed, M_PI)) *43758.5453);
+}
+
+void main() {
+  // 计算当前像素的UV坐标，添加随机偏移以实现抗锯齿和更平滑的图像效果
+  vec2 uv = gl_LaunchIDEXT.xy + vec2(random(gl_LaunchIDEXT.xy, 0), random(gl_LaunchIDEXT.xy, 1));
+  uv /= vec2(gl_LaunchSizeEXT.xy); // 将像素坐标转换为[0, 1]范围内的UV坐标
+  uv = (uv * 2.0f - 1.0f) * vec2(1.0f, -1.0f); // 将UV坐标从[0, 1]范围转换为[-1, 1]范围，并翻转Y轴，以适应屏幕空间的坐标系统
+
+  // 初始化 ray payload，设置光线的起点、方向、初始颜色和深度等信息
+  payload.rayOrigin = camera.position.xyz;
+  payload.rayDirection = normalize(uv.x * camera.right + uv.y * camera.up + camera.forward).xyz; 
+  payload.previousNormal = vec3(0.0, 0.0, 0.0);
+  payload.directColor = vec3(0.0, 0.0, 0.0);
+  payload.indirectColor = vec3(0.0, 0.0, 0.0);
+  payload.rayDepth = 0;
+  payload.rayActive = 1;
+
+  // 追踪光线，最多追踪16次，直到光线不再活跃或者达到最大深度
+  // 第 1 次：发射主光线，击中物体 -> Hit Shader 计算直接光照，并可能修改 payload.rayOrigin/Direction 准备反射光线。
+  // 第 2 次：基于新的原点/方向再次 traceRayEXT，计算二次反弹（间接光照）。
+  // ...
+  for (int x = 0; x < 16 && payload.rayActive == 1; x++) {
+    traceRayEXT(
+      topLevelAS, // 顶层加速结构
+      gl_RayFlagsOpaqueEXT, // 光线追踪标志，指定光线的行为，gl_RayFlagsOpaqueEXT表示几何体将被视为不透明的，遇到任何几何体都会停止
+      0xFF, // 该值是一个掩码，用于指定哪些实例和三角形应该被考虑进行光线追踪，0xFF表示所有的实例和三角形都将被考虑
+      0, // 索引，用于指定哪个Hit Shader将被调用，0表示第一个Hit Shader 
+      0, // 索引，用于指定哪个Miss Shader将被调用
+      0, // 索引，用于指定哪个Callable Shader将被调用
+      payload.rayOrigin, // 光线的起点，通常是摄像机的位置
+      0.001, 
+      payload.rayDirection, // 光线的方向，通常是从摄像机指向场景中的某个点
+      10000.0, 
+      0
+      );
+  }
+
+  vec4 color = vec4(payload.directColor + payload.indirectColor, 1.0);
+
+  // 时间抗锯齿TAA: 单帧看会有噪点，但多帧平均后，这些随机采样会填满整个像素，形成平滑图像。
+  // 如果当前帧不是第一帧，则从之前的图像中加载颜色，并与当前计算的颜色进行平均，以实现逐帧累积和降噪效果
+  if (camera.frameCount > 0) {
+    vec4 previousColor = imageLoad(image, ivec2(gl_LaunchIDEXT.xy));
+    previousColor *= camera.frameCount; // previousColor存的是平均值，要加上新的一帧，必须先把它变回总和
+    color += previousColor;
+    color /= (camera.frameCount + 1);
+  }
+
+  imageStore(image, ivec2(gl_LaunchIDEXT.xy), color);
+}
+
